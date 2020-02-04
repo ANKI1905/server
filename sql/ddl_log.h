@@ -41,7 +41,8 @@ enum ddl_log_entry_code
   DDL_LOG_EXECUTE_CODE= 1,
   DDL_LOG_ENTRY_CODE= 2,
   DDL_IGNORE_LOG_ENTRY_CODE= 3,
-  DDL_LOG_ENTRY_CODE_LAST= 4
+  DDL_TRY_LOG_ENTRY_CODE= 4,
+  DDL_LOG_ENTRY_CODE_LAST= 5
 };
 
 
@@ -187,13 +188,14 @@ typedef struct st_ddl_log_memory_entry
 
 typedef struct st_ddl_log_state
 {
-  uint next_entry, execute_entry_pos;
   /* List of ddl log entries */
   DDL_LOG_MEMORY_ENTRY *list;
   /* One execute entry per list */
   DDL_LOG_MEMORY_ENTRY *execute_entry;
   bool is_active() { return list != 0; }
 } DDL_LOG_STATE;
+
+extern const LEX_CSTRING file_action;
 
 
 /* These functions are for recovery */
@@ -206,9 +208,6 @@ int ddl_log_execute_recovery();
 bool ddl_log_write_entry(DDL_LOG_ENTRY *ddl_log_entry,
                            DDL_LOG_MEMORY_ENTRY **active_entry);
 
-bool ddl_log_write_execute_entry_internal(uint first_entry,
-                                          bool complete,
-                                          DDL_LOG_MEMORY_ENTRY **active_entry);
 bool ddl_log_write_execute_entry(uint first_entry,
                                  DDL_LOG_MEMORY_ENTRY **active_entry);
 bool ddl_log_disable_execute_entry(DDL_LOG_MEMORY_ENTRY **active_entry);
