@@ -210,16 +210,6 @@ extern "C" void wsrep_handle_SR_rollback(THD *bf_thd,
 extern "C" my_bool wsrep_thd_bf_abort(THD *bf_thd, THD *victim_thd,
                                       my_bool signal)
 {
-  DBUG_EXECUTE_IF("sync.before_wsrep_thd_abort",
-                 {
-                   const char act[]=
-                     "now "
-                     "SIGNAL sync.before_wsrep_thd_abort_reached "
-                     "WAIT_FOR signal.before_wsrep_thd_abort";
-                   DBUG_ASSERT(!debug_sync_set_action(bf_thd,
-                                                      STRING_WITH_LEN(act)));
-                 };);
-
   my_bool ret= wsrep_bf_abort(bf_thd, victim_thd);
   /*
     Send awake signal if victim was BF aborted or does not

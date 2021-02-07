@@ -62,6 +62,7 @@ this program; if not, write to the Free Software Foundation, Inc.,
 
 #include <my_service_manager.h>
 #include <key.h>
+#include <sql_manager.h>
 
 /* Include necessary InnoDB headers */
 #include "btr0btr.h"
@@ -5093,6 +5094,8 @@ static void innobase_kill_query(handlerton*, THD *thd, enum thd_kill_levels)
     if (lock_t *lock= trx->lock.wait_lock)
     {
       trx_mutex_enter(trx);
+      if (trx->is_wsrep() && wsrep_thd_is_aborting(thd))
+	trx->lock.was_chosen_as_deadlock_victim= TRUE;
       lock_cancel_waiting_and_release(lock);
       trx_mutex_exit(trx);
     }
@@ -18556,6 +18559,107 @@ static struct st_mysql_storage_engine innobase_storage_engine=
 
 #ifdef WITH_WSREP
 
+struct bg_wsrep_kill_trx_arg {
+       my_thread_id    thd_id, bf_thd_id;
+       trx_id_t        trx_id, bf_trx_id;
+       ibool           signal;
+};
+
+/** Kill one transaction from a background manager thread
+
+wsrep_innobase_kill_one_trx() is invoked when lock mutex and trx mutex
+are taken, wsrep_thd_bf_abort() cannot be used there as it takes THD mutexes
+that must be taken before lock and trx mutexes. That's why
+wsrep_innobase_kill_one_trx only posts the killing task to the manager thread
+and the actual killing happens asynchronously here.
+
+As no mutexes were held we don't know whether THD or trx pointers are still
+valid, so we need to pass thread/trx ids and perform a lookup.
+*/
+static void bg_wsrep_kill_trx(void *void_arg)
+{
+	bg_wsrep_kill_trx_arg *arg= (bg_wsrep_kill_trx_arg *)void_arg;
+	THD *thd, *bf_thd;
+	trx_t *victim_trx;
+	bool aborting= false;
+
+	bf_thd= find_thread_by_id_with_thd_data_lock(arg->bf_thd_id);
+	thd= find_thread_by_id_with_thd_data_lock(arg->thd_id);
+
+	if (!thd || !bf_thd || !(victim_trx= thd_to_trx(thd)))
+		goto ret0;
+
+	lock_mutex_enter();
+	trx_mutex_enter(victim_trx);
+	if (victim_trx->id != arg->trx_id)
+	{
+		/* apparently victim trx was meanwhile rolled back.
+		tell bf thd not to wait, in case it already started to */
+		trx_mutex_exit(victim_trx);
+		trx_t *trx= victim_trx= thd_to_trx(bf_thd);
+		trx_mutex_enter(trx);
+		if (lock_t *lock= trx->lock.wait_lock)
+		  lock_cancel_waiting_and_release(lock);
+		goto ret1;
+	}
+
+	DBUG_ASSERT(wsrep_on(bf_thd));
+
+	WSREP_LOG_CONFLICT(bf_thd, thd, TRUE);
+
+	WSREP_DEBUG("Aborter %s trx_id: " TRX_ID_FMT " thread: %ld "
+		"seqno: %lld client_state: %s client_mode: %s transaction_mode: %s "
+		"query: %s",
+		wsrep_thd_is_BF(bf_thd, false) ? "BF" : "normal",
+		arg->bf_trx_id,
+		thd_get_thread_id(bf_thd),
+		wsrep_thd_trx_seqno(bf_thd),
+		wsrep_thd_client_state_str(bf_thd),
+		wsrep_thd_client_mode_str(bf_thd),
+		wsrep_thd_transaction_state_str(bf_thd),
+		wsrep_thd_query(bf_thd));
+
+	WSREP_DEBUG("Victim %s trx_id: " TRX_ID_FMT " thread: %ld "
+		"seqno: %lld client_state: %s  client_mode: %s transaction_mode: %s "
+		"query: %s",
+		wsrep_thd_is_BF(thd, false) ? "BF" : "normal",
+		victim_trx->id,
+		thd_get_thread_id(thd),
+		wsrep_thd_trx_seqno(thd),
+		wsrep_thd_client_state_str(thd),
+		wsrep_thd_client_mode_str(thd),
+		wsrep_thd_transaction_state_str(thd),
+		wsrep_thd_query(thd));
+
+	/* Mark transaction as a victim for Galera abort */
+	victim_trx->lock.was_chosen_as_wsrep_victim= true;
+	if (wsrep_thd_set_wsrep_aborter(bf_thd, thd))
+	{
+	  WSREP_DEBUG("innodb kill transaction skipped due to wsrep_aborter set");
+	  goto ret1;
+	}
+
+	aborting= true;
+
+ret1:
+	trx_mutex_exit(victim_trx);
+	lock_mutex_exit();
+ret0:
+	if (thd) {
+		wsrep_thd_UNLOCK(thd);
+		wsrep_thd_kill_UNLOCK(thd);
+	}
+	if (aborting) {
+		DEBUG_SYNC(bf_thd, "before_wsrep_thd_abort");
+		wsrep_thd_bf_abort(bf_thd, thd, arg->signal);
+	}
+	if (bf_thd) {
+		wsrep_thd_UNLOCK(bf_thd);
+		wsrep_thd_kill_UNLOCK(bf_thd);
+	}
+	free(arg);
+}
+
 /** This function is used to kill one transaction.
 
 This transaction was open on this node (not-yet-committed), and a
@@ -18593,71 +18697,24 @@ wsrep_innobase_kill_one_trx(
 
 	DBUG_ENTER("wsrep_innobase_kill_one_trx");
 
-	THD *thd= (THD *) victim_trx->mysql_thd;
-	ut_ad(thd);
-	/* Note that bf_trx might not exist here e.g. on MDL conflict
-	case (test: galera_concurrent_ctas). Similarly, BF thread
-	could be also acquiring MDL-lock causing victim to be
-	aborted. However, we have not yet called innobase_trx_init()
-	for BF transaction (test: galera_many_columns)*/
+	DBUG_EXECUTE_IF("sync.before_wsrep_thd_abort",
+			 {
+			   const char act[]=
+			     "now "
+			     "SIGNAL sync.before_wsrep_thd_abort_reached "
+			     "WAIT_FOR signal.before_wsrep_thd_abort";
+			   DBUG_ASSERT(!debug_sync_set_action(bf_thd,
+							      STRING_WITH_LEN(act)));
+			 };);
+
 	trx_t* bf_trx= thd_to_trx(bf_thd);
-	DBUG_ASSERT(wsrep_on(bf_thd));
-
-	wsrep_thd_LOCK(thd);
-
-	WSREP_LOG_CONFLICT(bf_thd, thd, TRUE);
-
-	WSREP_DEBUG("Aborter %s trx_id: " TRX_ID_FMT " thread: %ld "
-		"seqno: %lld client_state: %s client_mode: %s transaction_mode: %s "
-		"query: %s",
-		wsrep_thd_is_BF(bf_thd, false) ? "BF" : "normal",
-		bf_trx ? bf_trx->id : TRX_ID_MAX,
-		thd_get_thread_id(bf_thd),
-		wsrep_thd_trx_seqno(bf_thd),
-		wsrep_thd_client_state_str(bf_thd),
-		wsrep_thd_client_mode_str(bf_thd),
-		wsrep_thd_transaction_state_str(bf_thd),
-		wsrep_thd_query(bf_thd));
-
-	WSREP_DEBUG("Victim %s trx_id: " TRX_ID_FMT " thread: %ld "
-		"seqno: %lld client_state: %s  client_mode: %s transaction_mode: %s "
-		"query: %s",
-		wsrep_thd_is_BF(thd, false) ? "BF" : "normal",
-		victim_trx->id,
-		thd_get_thread_id(thd),
-		wsrep_thd_trx_seqno(thd),
-		wsrep_thd_client_state_str(thd),
-		wsrep_thd_client_mode_str(thd),
-		wsrep_thd_transaction_state_str(thd),
-		wsrep_thd_query(thd));
-
-	/* Mark transaction as a victim for Galera abort */
-	victim_trx->lock.was_chosen_as_wsrep_victim= true;
-	if (wsrep_thd_set_wsrep_aborter(bf_thd, thd))
-	{
-	  WSREP_DEBUG("innodb kill transaction skipped due to wsrep_aborter set");
-	  wsrep_thd_UNLOCK(thd);
-	  DBUG_VOID_RETURN;
-	}
-
-	/* Note that we need to release this as it will be acquired
-	below in wsrep-lib */
-	wsrep_thd_UNLOCK(thd);
-	DEBUG_SYNC(bf_thd, "before_wsrep_thd_abort");
-
-	if (wsrep_thd_bf_abort(bf_thd, thd, signal))
-	{
-		lock_t*  wait_lock = victim_trx->lock.wait_lock;
-		if (wait_lock) {
-			DBUG_ASSERT(victim_trx->is_wsrep());
-			WSREP_DEBUG("victim has wait flag: %lu",
-				    thd_get_thread_id(thd));
-
-			WSREP_DEBUG("canceling wait lock");
-			victim_trx->lock.was_chosen_as_deadlock_victim= TRUE;
-			lock_cancel_waiting_and_release(wait_lock);
-		}
-	}
+	bg_wsrep_kill_trx_arg *arg = (bg_wsrep_kill_trx_arg*)malloc(sizeof(*arg));
+	arg->thd_id     = thd_get_thread_id(victim_trx->mysql_thd);
+	arg->trx_id     = victim_trx->id;
+	arg->bf_thd_id  = thd_get_thread_id(bf_thd);
+	arg->bf_trx_id  = bf_trx ? bf_trx->id : TRX_ID_MAX;
+	arg->signal     = signal;
+	mysql_manager_submit(bg_wsrep_kill_trx, arg);
 
 	DBUG_VOID_RETURN;
 }
@@ -18693,12 +18750,39 @@ wsrep_abort_transaction(
 	if (victim_trx) {
 		lock_mutex_enter();
 		trx_mutex_enter(victim_trx);
-		wsrep_innobase_kill_one_trx(bf_thd, victim_trx, signal);
+		victim_trx->lock.was_chosen_as_wsrep_victim= true;
 		trx_mutex_exit(victim_trx);
 		lock_mutex_exit();
+
+		wsrep_thd_LOCK(victim_thd);
+		bool aborting= !wsrep_thd_set_wsrep_aborter(bf_thd, victim_thd);
+		wsrep_thd_UNLOCK(victim_thd);
+		if (aborting) {
+			DEBUG_SYNC(bf_thd, "before_wsrep_thd_abort");
+			DBUG_EXECUTE_IF("sync.before_wsrep_thd_abort",
+					 {
+					   const char act[]=
+					     "now "
+					     "SIGNAL sync.before_wsrep_thd_abort_reached "
+					     "WAIT_FOR signal.before_wsrep_thd_abort";
+					   DBUG_ASSERT(!debug_sync_set_action(bf_thd,
+									      STRING_WITH_LEN(act)));
+					 };);
+			wsrep_thd_bf_abort(bf_thd, victim_thd, signal);
+		}
+
 		wsrep_srv_conc_cancel_wait(victim_trx);
 		DBUG_VOID_RETURN;
 	} else {
+		DBUG_EXECUTE_IF("sync.before_wsrep_thd_abort",
+				 {
+				   const char act[]=
+				     "now "
+				     "SIGNAL sync.before_wsrep_thd_abort_reached "
+				     "WAIT_FOR signal.before_wsrep_thd_abort";
+				   DBUG_ASSERT(!debug_sync_set_action(bf_thd,
+								      STRING_WITH_LEN(act)));
+				 };);
 		wsrep_thd_bf_abort(bf_thd, victim_thd, signal);
 	}
 
