@@ -37,6 +37,16 @@ extern "C" void wsrep_thd_UNLOCK(const THD *thd)
   mysql_mutex_unlock(&thd->LOCK_thd_data);
 }
 
+extern "C" void wsrep_thd_kill_LOCK(const THD *thd)
+{
+  mysql_mutex_lock(&thd->LOCK_thd_kill);
+}
+
+extern "C" void wsrep_thd_kill_UNLOCK(const THD *thd)
+{
+  mysql_mutex_unlock(&thd->LOCK_thd_kill);
+}
+
 extern "C" const char* wsrep_thd_client_state_str(const THD *thd)
 {
   return wsrep::to_c_string(thd->wsrep_cs().state());
@@ -199,16 +209,6 @@ extern "C" void wsrep_handle_SR_rollback(THD *bf_thd,
 extern "C" my_bool wsrep_thd_bf_abort(THD *bf_thd, THD *victim_thd,
                                       my_bool signal)
 {
-  DBUG_EXECUTE_IF("sync.before_wsrep_thd_abort",
-                 {
-                   const char act[]=
-                     "now "
-                     "SIGNAL sync.before_wsrep_thd_abort_reached "
-                     "WAIT_FOR signal.before_wsrep_thd_abort";
-                   DBUG_ASSERT(!debug_sync_set_action(bf_thd,
-                                                      STRING_WITH_LEN(act)));
-                 };);
-
   my_bool ret= wsrep_bf_abort(bf_thd, victim_thd);
   /*
     Send awake signal if victim was BF aborted or does not

@@ -3971,16 +3971,14 @@ int Xid_apply_log_event::do_apply_event(rpl_group_info *rgi)
       return err;
   }
 
+  mysql_mutex_lock(&thd->LOCK_thd_data);
 #ifdef WITH_WSREP
-  if (WSREP(thd)) mysql_mutex_lock(&thd->LOCK_thd_data);
-  if ((!res || (WSREP(thd) && thd->wsrep_trx().state() == wsrep::transaction::s_must_replay )) && sub_id)
+  if (sub_id && (!res || (WSREP(thd) && thd->wsrep_trx().state() == wsrep::transaction::s_must_replay)))
 #else
-  if (likely(!res) && sub_id)
+  if (sub_id && !res)
 #endif /* WITH_WSREP */
     rpl_global_gtid_slave_state->update_state_hash(sub_id, &gtid, hton, rgi);
-#ifdef WITH_WSREP
-  if (WSREP(thd)) mysql_mutex_unlock(&thd->LOCK_thd_data);
-#endif /* WITH_WSREP */
+  mysql_mutex_unlock(&thd->LOCK_thd_data);
   /*
     Increment the global status commit count variable
   */
@@ -7461,11 +7459,11 @@ int Rows_log_event::update_sequence()
     /* This event come from a setval function executed on the master.
        Update the sequence next_number and round, like we do with setval()
     */
-    my_bitmap_map *old_map= dbug_tmp_use_all_columns(table,
-                                                     table->read_set);
+    MY_BITMAP *old_map= dbug_tmp_use_all_columns(table,
+                                                 &table->read_set);
     longlong nextval= table->field[NEXT_FIELD_NO]->val_int();
     longlong round= table->field[ROUND_FIELD_NO]->val_int();
-    dbug_tmp_restore_column_map(table->read_set, old_map);
+    dbug_tmp_restore_column_map(&table->read_set, old_map);
 
     return table->s->sequence->set_value(table, nextval, round, 0) > 0;
   }
